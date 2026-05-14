@@ -12,6 +12,12 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 def detect_threat():
+    """
+    Returns:
+        True  - threat detected (person/dog/cow in frame)
+        False - safe (no threat objects in frame)
+        None  - error or quit signal (camera failed or user pressed 'q')
+    """
     # Retry reading frame a few times
     for attempt in range(3):
         ret, frame = cap.read()
@@ -21,7 +27,7 @@ def detect_threat():
     
     if not ret:
         print(f"⚠️ Failed to read frame after 3 attempts")
-        return False
+        return None
 
     results = model(frame, imgsz=416, conf=0.5)
 
@@ -57,7 +63,7 @@ def detect_threat():
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     
     # Add threat status to frame
-    status_text = "⚠️ THREAT DETECTED!" if threat else "✅ SAFE"
+    status_text = "THREAT DETECTED!" if threat else "SAFE"
     status_color = (0, 0, 255) if threat else (0, 255, 0)
     cv2.putText(annotated_frame, status_text, (20, 40), 
                cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
@@ -69,20 +75,22 @@ def detect_threat():
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         cv2.destroyAllWindows()
-        return False
+        return None
 
     return threat
 
 
 if __name__ == "__main__":
-    print("🎥 Starting YOLO Detection... Press 'q' to quit")
+    print("Starting YOLO Detection... Press 'q' to quit")
     
     # Check if camera is available
     if not cap.isOpened():
-        print("❌ ERROR: Cannot access camera. Check if it's connected or in use.")
+        print("ERROR: Cannot access camera. Check if it's connected or in use.")
     else:
-        print("✅ Camera connected")
-        while detect_threat():
-            pass
+        print("Camera connected")
+        while True:
+            result = detect_threat()
+            if result is None:
+                break
     
     cap.release()

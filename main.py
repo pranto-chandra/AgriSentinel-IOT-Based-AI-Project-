@@ -10,26 +10,28 @@ ESP_IP = "192.168.43.146"  # ← PUT YOUR ESP IP HERE
 # -------- SESSION FOR PERSISTENT CONNECTION --------
 session = requests.Session()
 
-# -------- SENSOR FETCH --------
-def get_sensor():
+# -------- CONSOLIDATED COMMUNICATION --------
+def esp_sync(threat, pump, ai_msg=None):
+    """
+    Sends states to ESP and returns latest sensor data in one request.
+    """
+    params = {
+        't': 1 if threat else 0,
+        'p': 1 if pump else 0
+    }
+    
+    if ai_msg:
+        params['msg'] = ai_msg
+    
+    url = f"http://{ESP_IP}/sync"
+    
     try:
-        res = session.get(f"http://{ESP_IP}", timeout=1.0)
-        return res.json()
+        # requests handles URL encoding of params automatically
+        res = session.get(url, params=params, timeout=2.0)
+        data = res.json()
+        return data
     except Exception as e:
         return None
-
-# -------- CONSOLIDATED SYNC --------
-def sync_with_esp(threat, pump):
-    t_val = 1 if threat else 0
-    p_val = 1 if pump else 0
-    try:
-        # One request updates both states simultaneously!
-        session.get(f"http://{ESP_IP}/sync?t={t_val}&p={p_val}", timeout=0.8)
-        print(f"🔄 Sync: Threat={'ON' if threat else 'OFF'}, Pump={'ON' if pump else 'OFF'}")
-        return True
-    except:
-        print(f"❌ Sync failed")
-        return False
 
 # -------- SYSTEM STATE TRACKING --------
 current_pump_on = False
@@ -40,11 +42,17 @@ current_threat_active = False
 threat_frame_count = 0
 safe_frame_count = 0
 
+# Initialize sensor variables with neutral values
+soil, temp, hum = 70, 25, 50
+
 # -------- MAIN LOOP --------
 print("\n" + "="*40)
 print("      AgriSentinel Intelligence Cycle")
-print("      (Consolidated Parallel Sync)")
+print("      (Consolidated High-Speed Sync)")
 print("="*40)
+
+# Global tracking for AI
+last_explanation = "অপেক্ষা করা হচ্ছে..."
 
 while True:
     loop_start = time.time()
@@ -52,7 +60,12 @@ while True:
     # 1️⃣ PERCEPTION: THREAT DETECTION
     raw_threat = detect_threat()
     
-    # --- THREAT SMOOTHING ---
+    if raw_threat is None:
+        print("⚠️ Camera issue - skipping frame")
+        time.sleep(0.5)
+        continue
+    
+    # Smoothing
     if raw_threat:
         threat_frame_count += 1
         safe_frame_count = 0
@@ -60,59 +73,65 @@ while True:
         safe_frame_count += 1
         threat_frame_count = 0
 
-    # Determine stable threat state
     new_threat_active = current_threat_active
     if threat_frame_count >= 2:
         new_threat_active = True
-    elif safe_frame_count >= 10:
+    elif safe_frame_count >= 1: # Instant reset when threat moves
         new_threat_active = False
 
-    # 2️⃣ DATA ACQUISITION
-    data = get_sensor()
-    if data is None:
-        soil, temp, hum = 100, 25, 50 
-    else:
+    # 2️⃣ COGNITIVE: AI REASONING (Every 5s)
+    current_explanation = None
+    if int(time.time()) % 5 == 0:
+        # Calculate potential pump time for AI
+        irr_need = fuzzy_refine(soil, temp, hum)
+        calc_pump_time = (irr_need / 100) * 15
+        calc_pump_time = max(2, min(calc_pump_time, 20))
+        if soil >= 75: calc_pump_time = 0
+        
+        last_explanation = get_explanation(soil, temp, hum, calc_pump_time, new_threat_active)
+        current_explanation = last_explanation # Send this loop
+        print(f"🤖 AI Reasoning: {last_explanation}")
+
+    # 3️⃣ SYNCHRONIZATION & DATA FETCH (The Master Call)
+    # We always call this to get sensor data, even if state hasn't changed
+    data = esp_sync(new_threat_active, current_pump_on, current_explanation)
+
+    if data is not None:
         soil = data['soil']
         temp = data['temperature']
         hum = data['humidity']
-        print(f"📊 Sensors: Soil={soil}%, Temp={temp}C, Hum={hum}%")
+        # Update our tracking of what the ESP thinks
+        current_threat_active = new_threat_active
+        print(f"📊 Sensors: Soil={soil}%, Temp={temp}C, Hum={hum}% | Sync: OK")
+    else:
+        print("⚠️ Sync failed - ESP unreachable")
 
-    # 3️⃣ DECISION: FUZZY LOGIC
+    # 4️⃣ DECISION: FUZZY LOGIC (Based on fresh sync data)
     irr_need = fuzzy_refine(soil, temp, hum)
-    
-    # 4️⃣ EXECUTION: NON-BLOCKING LOGIC
-    new_pump_on = current_pump_on
+    calc_pump_time = (irr_need / 100) * 15
+    calc_pump_time = max(2, min(calc_pump_time, 20))
+    if soil >= 75: calc_pump_time = 0
 
-    # Check for pump STOP
+    # 5️⃣ PUMP CONTROL LOGIC
+    new_pump_on = current_pump_on
     if current_pump_on and time.time() >= pump_stop_time:
         new_pump_on = False
         print("🛑 Pump Timer Finished")
 
-    # Check for pump START
     if data is not None:
         if soil < 65 and not current_pump_on:
-            pump_time = (irr_need / 100) * 15
-            pump_time = max(2, min(pump_time, 20))
             new_pump_on = True
-            pump_stop_time = time.time() + pump_time
-            print(f"🌵 Soil Dry - Starting Pump for {pump_time:.1f}s")
-        
+            pump_stop_time = time.time() + calc_pump_time
+            print(f"🌵 Soil Dry - Starting Pump for {calc_pump_time:.1f}s")
         elif soil > 75 and current_pump_on:
             new_pump_on = False
             print("✅ Soil Saturated - Stopping Pump")
 
-    # 5️⃣ SYNCHRONIZATION (The Parallel Fix)
-    # Only send to ESP if either Threat OR Pump state changed
-    if new_threat_active != current_threat_active or new_pump_on != current_pump_on:
-        if sync_with_esp(new_threat_active, new_pump_on):
-            current_threat_active = new_threat_active
-            current_pump_on = new_pump_on
-
-    # 6️⃣ COGNITIVE: EXPLAINABILITY
-    if int(time.time()) % 5 == 0:
-        explanation = get_explanation(soil, temp, hum, irr_need, current_threat_active)
-        print(f"🤖 AI Reasoning: {explanation}")
+    # If pump state changed, force one more sync to update relay immediately
+    if new_pump_on != current_pump_on:
+        esp_sync(new_threat_active, new_pump_on)
+        current_pump_on = new_pump_on
 
     # Steady Loop
     elapsed = time.time() - loop_start
-    time.sleep(max(0.1, 1.0 - elapsed))
+    time.sleep(max(0.1, 0.5 - elapsed))

@@ -9,14 +9,10 @@
 #define DHTTYPE DHT22
 #define SOIL_PIN A0
 #define RELAY_PIN D5
+#define BUZZER_PIN D6  // ← NEW: Buzzer Pin
 
-// Soil moisture calibration values
-// THESE VALUES NEED TO BE CALIBRATED FOR YOUR SENSOR:
-// - dry_value: ADC reading when sensor is completely DRY in air
-// - wet_value: ADC reading when sensor is completely WET in water
-#define SOIL_DRY_VALUE 1024    // ADC value when completely dry
-#define SOIL_WET_VALUE 400     // ADC value when in water
-
+#define SOIL_DRY_VALUE 1024
+#define SOIL_WET_VALUE 400
 
 // ---------------- OLED ----------------
 #define SCREEN_WIDTH 128
@@ -25,46 +21,37 @@ Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // ---------------- OBJECTS ----------------
 DHT dht(DHTPIN, DHTTYPE);
-
-// ---------------- WIFI ----------------
-// const char* ssid = "Advaita Voice";
-// const char* password = "voice1234";
-
-const char* ssid = "Zoom";
-const char* password = "majargate";
-
 WiFiServer server(80);
 
 // ---------------- GLOBAL STATE ----------------
 String systemState = "IDLE";
 bool pumpStatus = false;
+String aiReasoning = "অপেক্ষা করা হচ্ছে..."; // LLM Explanation in Bangla
 
 // ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
-
   dht.begin();
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);  // Pump OFF initially
+  digitalWrite(RELAY_PIN, HIGH); // Relay OFF (Active Low)
 
-  // OLED init (SDA = D2, SCL = D1)
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW); // Buzzer OFF
+
   Wire.begin(D2, D1);
-
-  if (!display.begin(0x3C, true)) {
-    Serial.println("OLED not found!");
-  }
+  if (!display.begin(0x3C, true)) Serial.println("OLED not found!");
 
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
-
   display.setCursor(0, 0);
   display.println("AgriSentinel");
   display.println("Connecting WiFi...");
   display.display();
 
-  // WiFi connect
+  const char* ssid = "Zoom";
+  const char* password = "majargate";
   WiFi.begin(ssid, password);
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -73,173 +60,114 @@ void setup() {
   }
 
   Serial.println("\nConnected!");
-  Serial.println(WiFi.localIP());
-
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println("WiFi Connected");
-  display.println(WiFi.localIP());
-  display.display();
-
   server.begin();
 }
 
 // ---------------- LOOP ----------------
 void loop() {
-
-  // -------- SENSOR READINGS --------
   float temp = dht.readTemperature();
   float hum = dht.readHumidity();
   int soil_raw = analogRead(SOIL_PIN);
-  
-  // Convert soil ADC to percentage (0-100%)
   int soil = constrain(map(soil_raw, SOIL_DRY_VALUE, SOIL_WET_VALUE, 0, 100), 0, 100);
 
-  if (isnan(temp) || isnan(hum)) {
-    temp = 0;
-    hum = 0;
+  if (isnan(temp) || isnan(hum)) { temp = 0; hum = 0; }
+
+  // Buzzer Control (Only on Threat)
+  if (systemState == "THREAT!") {
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
   }
 
-  // -------- OLED DISPLAY (ALWAYS REFRESH) --------
-  /*
+  // OLED Display
   display.clearDisplay();
-
   display.setCursor(0, 0);
-  display.println("AgriSentinel");
-
-  display.setCursor(0, 12);
-  display.print("Temp: ");
-  display.print(temp);
-  display.println(" C");
-
-  display.print("Hum: ");
-  display.print(hum);
-  display.println(" %");
-
-  display.print("Soil: ");
-  display.println(soil);
-
-  display.println("----------------");
-
-  display.print("State: ");
-  display.println(systemState);
-
-  display.print("Pump: ");
-  display.println(pumpStatus ? "ON" : "OFF");
-
-  display.display();
-  */
-
-  display.clearDisplay();
-  display.setTextSize(1); // Ensure text is small
-  display.setTextColor(SH110X_WHITE);
-
-  // Header
-  display.setCursor(0, 0);
-  display.println("AgriSentinel");
-
-  // Sensor Data
+  display.println("AgriSentinel v2");
   display.setCursor(0, 10);
-  display.print("Temp: "); 
-  display.print(temp); 
-  display.println(" C"); // 1 decimal place to save space
-  
-  display.setCursor(0, 20);
-  display.print("Hum:  "); 
-  display.print(hum); 
-  display.println(" %");
-
-  display.setCursor(0, 30);
-  display.print("Soil: "); 
-  display.println(soil);
-
-  // System Status
+  display.print("Temp: "); display.print(temp); display.println(" C");
+  display.print("Hum:  "); display.print(hum); display.println(" %");
+  display.print("Soil: "); display.println(soil);
   display.setCursor(0, 40);
   display.print("S: "); display.print(systemState);
   display.print(" | P: "); display.println(pumpStatus ? "ON" : "OFF");
-
-  // IP Address (Static at bottom)
   display.setCursor(0, 54); 
-  display.print("IP: ");
-  display.print(WiFi.localIP());
-
+  display.print("IP: "); display.print(WiFi.localIP());
   display.display();
 
-  // -------- HANDLE CLIENT REQUEST --------
   WiFiClient client = server.available();
-
   if (client) {
-    // Set timeout for client
-    client.setTimeout(5000);
-    
     String request = client.readStringUntil('\r');
-    Serial.print("Request: ");
-    Serial.println(request);
-    
     client.flush();
 
-    // -------- CONSOLIDATED SYNC COMMAND --------
+    // 1. UPDATE AI REASONING (From Python)
+    if (request.indexOf("msg=") != -1) {
+        int startPos = request.indexOf("msg=") + 4;
+        int endPos = request.indexOf(" HTTP");
+        if (endPos == -1) endPos = request.length();
+        aiReasoning = urlDecode(request.substring(startPos, endPos));
+    }
+
     if (request.indexOf("/sync") != -1) {
-      // Parse threat state (?t=1 or ?t=0)
-      if (request.indexOf("t=1") != -1) {
-        systemState = "THREAT!";
-      } else if (request.indexOf("t=0") != -1) {
-        systemState = "IDLE";
-      }
+        // Sync State (Threat & Pump)
+        if (request.indexOf("t=1") != -1) systemState = "THREAT!";
+        else if (request.indexOf("t=0") != -1) systemState = "IDLE";
 
-      // Parse pump state (?p=1 or ?p=0)
-      if (request.indexOf("p=1") != -1) {
-        digitalWrite(RELAY_PIN, LOW); // Active Low: LOW is ON
-        pumpStatus = true;
-      } else if (request.indexOf("p=0") != -1) {
-        digitalWrite(RELAY_PIN, HIGH); // Active Low: HIGH is OFF
-        pumpStatus = false;
-      }
-      Serial.println("Sync complete");
+        if (request.indexOf("p=1") != -1) { digitalWrite(RELAY_PIN, LOW); pumpStatus = true; }
+        else if (request.indexOf("p=0") != -1) { digitalWrite(RELAY_PIN, HIGH); pumpStatus = false; }
     }
 
-    // -------- INDIVIDUAL COMMANDS (Backwards compatibility) --------
-    if (request.indexOf("/pump_on") != -1) {
-      digitalWrite(RELAY_PIN, LOW);
-      pumpStatus = true;
+    // --- 2. RESPOND ---
+    if (request.indexOf("GET /dashboard") != -1) {
+      // HTML Dashboard Response
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-Type: text/html; charset=utf-8");
+      client.println("");
+      client.println("<!DOCTYPE HTML><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>");
+      client.println("<style>body{font-family:Arial; text-align:center; background:#f4f4f4; margin:0; padding:20px;}");
+      client.println(".card{background:white; padding:20px; border-radius:15px; box-shadow:0 4px 8px rgba(0,0,0,0.1); margin:10px auto; max-width:400px;}");
+      client.println("h1{color:#2c3e50;} .status{font-weight:bold; font-size:1.2em;}");
+      client.println(".threat{color:red;} .safe{color:green;} .pump-on{color:blue;} .pump-off{color:gray;}");
+      client.println(".ai-box{background:#e8f4fd; border-left:5px solid #3498db; padding:15px; margin-top:20px; text-align:left; font-style:italic;}");
+      client.println("</style><script>setInterval(function(){location.reload();}, 3000);</script></head><body>");
+      client.println("<h1>AgriSentinel Dashboard</h1><p>Live Monitoring System</p>");
+      client.print("<div class='card'><h2>Sensors</h2><p>Temp: <b>"); client.print(temp); client.print(" °C</b></p>");
+      client.print("<p>Hum: <b>"); client.print(hum); client.print(" %</b></p>");
+      client.print("<p>Soil: <b>"); client.print(soil); client.println(" %</b></p></div>");
+      client.print("<div class='card'><h2>Status</h2><p>Security: <span class='status ");
+      client.print((systemState=="THREAT!")?"threat'>THREAT DETECTED":"safe'>ALL SAFE");
+      client.println("</span></p><p>Pump: <span class='status ");
+      client.print(pumpStatus?"pump-on'>RUNNING":"pump-off'>STOPPED");
+      client.println("</span></p></div>");
+      client.print("<div class='card'><h2>🤖 AI Reasoning (Bangla)</h2><div class='ai-box'>"); 
+      client.print(aiReasoning); client.println("</div></div></body></html>");
+    } 
+    else {
+      // JSON Response (Combined for Data & Sync)
+      String json = "{\"temperature\":" + String(temp) + ",\"humidity\":" + String(hum) + ",\"soil\":" + String(soil) + ",\"pump\":" + String(pumpStatus?1:0) + "}";
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-Type: application/json");
+      client.print("Content-Length: "); client.println(json.length());
+      client.println("Connection: close");
+      client.println("");
+      client.print(json);
     }
-
-    if (request.indexOf("/pump_off") != -1) {
-      digitalWrite(RELAY_PIN, HIGH);
-      pumpStatus = false;
-    }
-
-    if (request.indexOf("/threat") != -1) {
-      systemState = "THREAT!";
-    }
-
-    if (request.indexOf("/idle") != -1) {
-      systemState = "IDLE";
-    }
-
-    // -------- PREPARE JSON RESPONSE --------
-    String jsonResponse = "{";
-    jsonResponse += "\"temperature\":"; jsonResponse += temp; jsonResponse += ",";
-    jsonResponse += "\"humidity\":"; jsonResponse += hum; jsonResponse += ",";
-    jsonResponse += "\"soil\":"; jsonResponse += soil; jsonResponse += ",";
-    jsonResponse += "\"pump\":"; jsonResponse += (pumpStatus ? 1 : 0);
-    jsonResponse += "}";
-
-    // -------- SEND HTTP RESPONSE WITH PROPER HEADERS --------
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: application/json");
-    client.print("Content-Length: ");
-    client.println(jsonResponse.length());
-    client.println("Connection: close");
-    client.println("");
-    client.print(jsonResponse);
-    client.println();
-
-    // Ensure client disconnects
-    client.flush();
     client.stop();
-    delay(10);
   }
+}
 
-  // No delay here ensures the server is always listening for commands!
+// Helper to decode URL characters (for Bangla support)
+String urlDecode(String str) {
+    String res = "";
+    for (int i = 0; i < str.length(); i++) {
+        if (str[i] == '%' && i + 2 < str.length()) {
+            String hex = str.substring(i + 1, i + 3);
+            res += (char) strtol(hex.c_str(), NULL, 16);
+            i += 2;
+        } else if (str[i] == '+') {
+            res += ' ';
+        } else {
+            res += str[i];
+        }
+    }
+    return res;
 }
